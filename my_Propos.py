@@ -1,4 +1,5 @@
 #Bootstrap your own latent
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +10,9 @@ import torchvision.transforms as transforms
 class Online_Net(nn.Module):
     def __init__(self):
         super(Online_Net, self).__init__()
+        #backbone
         self.model = torchvision.models.resnet18(pretrained=False)
+        #fit with the CIFAR10(small size)
         self.model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=3, bias=False)
         self.model.maxpool=nn.Identity()
 
@@ -81,81 +84,63 @@ def k_means(x, n_clusters):
     return labels, c
 
 
-#Propos
-class Propos(nn.Module):
-    def __init__(self, projection_size, hidden_size, n_clusters, variance):
-        super(Propos, self).__init__()
-        self.online_net = Online_Net()
-        self.target_net = Target_Net()
-        self.positive_sampling = Positive_Sampling(variance)
-        self.projection_size = projection_size
-        self.hidden_size = hidden_size
-        self.n_clusters = n_clusters
-        self.predictor = MLP(projection_size, hidden_size)
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.to(self.device)
+#augmentation utils——SimCLR
+def default(val, def_val):
+    return def_val if val is None else val
+
+class Default_Augmentation(nn.Module):
+    def __init__(self, image_size, augment_fn=None, augment_fn2=None):
+        super(Default_Augmentation, self).__init__()
+        DEFAULT_AUG = torch.nn.Sequential(
+            RandomApply(
+                transforms.ColorJitter(0.8, 0.8, 0.8, 0.2),
+                p = 0.3
+            ),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop((image_size, image_size)),
+            transforms.Normalize(
+                mean=torch.tensor([0.485, 0.456, 0.406]),
+                std=torch.tensor([0.229, 0.224, 0.225])),
+        )
+        self.augment1 = default(augment_fn, DEFAULT_AUG)
+        self.augment2 = default(augment_fn2, self.augment1)
+
+
     
     def forward(self, x):
-        #x.size() = (batch_size,3,224,224)
-        #output.size() = (batch_size,1000)
-        output = self.online_net(x)
-        return output
+        image_one, image_two = self.augment1(x), self.augment2(x)
+        return image_one, image_two
+        
     
-    def update_target_net(self):
-        self.target_net.load_state_dict(self.online_net.state_dict())
-    
-    def update_predictor(self, x):
-        #x.size() = (batch_size,1000)
-        #output.size() = (batch_size,projection_size)
-        output = self.predictor(x)
-        return output
-    
-    def update_labels(self, x):
-        #x.size() = (batch_size,projection_size)
-        #labels.size() = (batch_size)
-        labels, _ = k_means(x, self.n_clusters)
-        return labels
-    
-    def update_loss(self, x, labels):
-        #x.size() = (batch_size,projection_size)
-        #labels.size() = (batch_size)
-        #loss.size() = (1)
-        loss = self.criterion(x, labels)
-        return loss
-    
-    def update(self, x):
-        #x.size() = (batch_size,3,224,224)
-        #output.size() = (batch_size,1000)
-        output = self.forward(x)
-        #output.size() = (batch_size,projection_size)
-        output = self.update_mlp(output)
-        #labels.size() = (batch_size)
-        labels = self.update_labels(output)
-        #loss.size() = (1)
-        loss = self.update_loss(output, labels)
-        #update the parameters
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return loss
-    
-    def update_online_net(self, x):
-        #x.size() = (batch_size,3,224,224)
-        #output.size() = (batch_size,1000)
-        output = self.forward(x)
-        #output.size() = (batch_size,projection_size)
-        output = self.update_mlp(output)
-        #labels.size() = (batch_size)
-        labels = self.update_labels(output)
-        #loss.size() = (1)
-        loss = self.update_loss(output, labels)
-        #update the parameters
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return loss
-    
-    def update_target_net(self):
-        self.target_net.load_state_dict(self.online_net.state_dict())
+
+
+class RandomApply(nn.Module):
+    def __init__(self, fn, p):
+        super().__init__()
+        self.fn = fn
+        self.p = p
+    def forward(self, x):
+        if random.random() > self.p:
+            return x
+        return self.fn(x)
+
+# default SimCLR augmentation
+
+
+
+#Propos
+#load the datasets
+datasets = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToTensor())
+#load the dataloader
+batch_size = 128
+dataloader = torch.utils.data.DataLoader(datasets, batch_size=batch_size, shuffle=True, num_workers=2)
+for data in dataloader:
+    images, labels = data
+    print(images.size())
+    print(labels.size())
+    break
+
+
+
+
