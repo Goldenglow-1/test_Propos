@@ -56,32 +56,25 @@ def MLP(projection_size, hidden_size):
         nn.Linear(hidden_size, projection_size),
     )
 
-#k-means
-def k_means(x, n_clusters):
+#k-means,get the cluster assignment posterior probability p(k|x)
+def k_means(x, n_clusters, centroids):
     N, D = x.size()
-    #randomly choose n_clusters samples as the initial centroids
-    c = x[torch.randperm(N)[:n_clusters]]
     #repeat the centroids to have same size as x
-    c = torch.repeat_interleave(c, repeats=N//n_clusters, dim=0)
-    #add the remaining centroids
-    c = torch.cat([c, x[:N % n_clusters]], dim=0)
-    #repeat the x to have same size as centroids
-    x = torch.repeat_interleave(x, repeats=n_clusters, dim=0)
-    #assign the labels
-    labels = torch.zeros(N, dtype=torch.long)
-    
+    c = centroids
+
     #compute the distances between each sample and each centroid
     distances = torch.cdist(x, c)
-    #assign the labels
-    new_labels = torch.argmin(distances, dim=1)
-    #if the labels are the same, then break
+    #compute the cluster assignment postrerior probability p(k|x)
+    labels = torch.argmin(distances, dim=1)
+    p_k_x = torch.zeros(N, n_clusters)
+    p_k_x[torch.arange(N), labels] = 1
+    return p_k_x
+
+
+    
+
         
-    #assign the new labels
-    labels = new_labels
-    #update the centroids
-    for i in range(n_clusters):
-        c[i] = x[labels == i].mean(dim=0)
-    return labels, c
+   
 
 
 #augmentation utils——SimCLR
@@ -125,22 +118,81 @@ class RandomApply(nn.Module):
             return x
         return self.fn(x)
 
-# default SimCLR augmentation
+# exponential moving average
+class EMA():
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
 
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
 
 
 #Propos
-#load the datasets
-datasets = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToTensor())
-#load the dataloader
+#hyperparameters
 batch_size = 128
-dataloader = torch.utils.data.DataLoader(datasets, batch_size=batch_size, shuffle=True, num_workers=2)
-for data in dataloader:
-    images, labels = data
-    print(images.size())
-    print(labels.size())
-    break
+moving_average_decay = 0.99
+learning_rate = 0.05
+num_epochs = 100
 
+
+
+#load the dataset
+datasets = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToTensor())
+
+
+#load the dataloader
+dataloader = torch.utils.data.DataLoader(datasets, batch_size=batch_size, shuffle=True, num_workers=2)
+
+#initialize the device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+#initialize the online network and target network
+online_net = Online_Net().to(device)
+target_net = None
+
+
+#initialize the updater for the target network
+target_ema_updater = EMA(moving_average_decay)
+
+
+
+#initialize the projection head
+online_predictor = MLP(1000, 1000).to(device)
+
+
+#initialize the optimizer
+optimizer_online = torch.optim.SGD(online_net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+optimizer_predictor = torch.optim.SGD(online_predictor.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+
+
+#initialize the augmentation
+augmentation = Default_Augmentation(32).to(device)
+
+
+#randomly initialize the centroids
+centroids = torch.randn(1000, 10).to(device)
+
+for epoch in range(num_epochs):
+    
+    for i, mini_batch in enumerate(dataloader):
+        images, _ = mini_batch
+        images = images.to(device)
+
+
+        target_features = target_net(images)
+        p_k_x = k_means(target_features, 10, centroids=centroids)
+        #get the augmented images
+        images_one, images_two = augmentation(images)
+
+        
+    
+    
+        
+        
 
 
 
