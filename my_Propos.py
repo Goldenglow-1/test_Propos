@@ -8,6 +8,11 @@ import torchvision.transforms as transforms
 import copy
 from matplotlib import pyplot as plt
 
+#initialize the device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+#torch.autograd.set_detect_anomaly(True)
+
 
 def plot_curve(data):#visualize the loss function
     fig = plt.figure()
@@ -72,7 +77,7 @@ class Positive_Sampling(nn.Module):
     def forward(self, x):
         #x.size() = (batch_size,1000)
         #output.size() = (batch_size,1000)
-        output = x + self.variance * torch.randn(x.size())
+        output = x + self.variance * torch.randn(x.size()).to(device)
         return output
 
 #MLP
@@ -164,13 +169,13 @@ class cluster_loss(nn.Module):
 
         mat = torch.matmul(centers, centers_prime.T)
 
-        part_1 = -mat.diag().mean()/self.temperature.float()
+        part_1 = -mat.diag().mean()/self.temperature
 
         mat = torch.exp(mat/ self.temperature)
 
         mat = mat.fill_diagonal_(0)
 
-        part_2 = torch.log(mat.sum(dim=1, keepdim=True)).mean().float()
+        part_2 = torch.log(1+torch.relu(mat.sum(dim=1, keepdim=True))).mean()
 
         loss = part_1 + part_2
         
@@ -200,7 +205,7 @@ def update_centroids(target_features_from_raw_input, p_k_x, num_clusters):
 #hyperparameters
 batch_size = 128
 moving_average_decay = 0.99
-learning_rate = 0.05
+learning_rate = 0.001
 num_epochs = 100
 n_clusters = 10
 temperature = 0.5
@@ -215,12 +220,13 @@ datasets = torchvision.datasets.CIFAR10(root='./data', train=True, download=True
 dataloader = torch.utils.data.DataLoader(datasets, batch_size=batch_size, shuffle=True, num_workers=2)
 
 
+
+
 #get all the images from the dataset
-images_all = torch.cat([x[0] for x in dataloader], dim=0)
+#images_all = torch.cat([x[0] for x in dataloader], dim=0).to(device)
 
 
-#initialize the device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 
 #initialize the online network and target network
@@ -234,7 +240,7 @@ target_net = None
 #initialize the updater for the target network
 target_ema_updater = EMA(moving_average_decay)
 
-target_moving_average = update_moving_average(target_ema_updater, target_net, online_net)
+#target_moving_average = update_moving_average(target_ema_updater, target_net, online_net)
 
 #initialize the projection head
 online_predictor = MLP(1000, 1000).to(device)
@@ -261,16 +267,13 @@ train_loss= []
 
 
 for epoch in range(num_epochs):
-
+    
 
 
     with torch.no_grad():
         target_net = get_target_net(online_net)
+        target_moving_average = update_moving_average(target_ema_updater, target_net, online_net)
 
-    #update the centroids and the p_k_x
-    target_features_from_raw_input_all = target_net(images_all)
-    p_k_x_all = get_p_k_x(target_features_from_raw_input_all, n_clusters, centroids=centroids)
-    centroids = update_centroids(target_features_from_raw_input_all, p_k_x_all, n_clusters)
 
 
 
@@ -280,11 +283,23 @@ for epoch in range(num_epochs):
 
 
             target_features_from_raw_input = target_net(images)
-            p_k_x_batch_size = get_p_k_x(target_features_from_raw_input, 10, centroids=centroids)
+            p_k_x_batch_size = get_p_k_x(target_features_from_raw_input, 10, centroids=centroids).to(device)
+
+
+            #update the centroids by mini_batch because of the error "cuda out of memory"
+            for i in range(n_clusters):
+
+                #p_k_x.shape = (N,num_clusters)
+                #get the points that belong to the i-th cluster
+                cluster_points = target_features_from_raw_input[p_k_x_batch_size[:, i] == 1]
+                #compute the mean of the points
+                centroids[i] = torch.mean(cluster_points, dim=0)
+            
+
             #get the augmented images
             images_one, images_two = augmentation(images)
             #get the online features
-            online_features = online_net(images_one)
+            online_features = online_net(images_one).to(device)
             target_features = target_net(images_two)
 
 
@@ -295,6 +310,8 @@ for epoch in range(num_epochs):
             positive_features = positive_samples(online_features)
 
             #compute the cluster centers for the online features
+            print(p_k_x_batch_size.T.is_cuda)
+            print(online_features.is_cuda)
             centroids_online_features = torch.matmul(p_k_x_batch_size.T, online_features)
 
             centroids_online_features = centroids_online_features / torch.norm(centroids_online_features, dim=1, keepdim=True)
@@ -324,8 +341,8 @@ for epoch in range(num_epochs):
             loss_PSL = Cluster_Loss(centroids_online_features, centroids_target_features)
 
             loss = loss_PSA + lamda_PSL * loss_PSL
-
-            loss.backward()
+            with torch.autograd.detect_anomaly():
+                loss.backward()
 
             target_moving_average()
             optimizer_online.step()
@@ -333,9 +350,11 @@ for epoch in range(num_epochs):
             train_loss.append(loss.item())
             if i % 50 == 0:
                 print('epoch:{}, iter:{}, loss:{}'.format(epoch, i, loss.item()))
+                  
 
-plot_curve(train_loss, 'train_loss')
-torch.save(online_net.state_dict(), 'online_net.pth')
+# plot_curve(train_loss, 'train_loss')
+# torch.save(online_net.state_dict(), 'online_net.pth')
+#
 
 
         
