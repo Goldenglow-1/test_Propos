@@ -11,7 +11,7 @@ from matplotlib import pyplot as plt
 #initialize the device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-#torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(True)
 
 
 def plot_curve(data):#visualize the loss function
@@ -38,6 +38,23 @@ class Online_Net(nn.Module):
         output = self.model(x)
         #size of the ouput is (batch_size,1000)
         return output
+    
+    def update_moving_average(self, ema_updater, online_net):
+        for current_params, ma_params in zip(online_net.parameters(), self.parameters()):
+            old_weight, up_weight = ma_params.data, current_params.data
+            ma_params.data = ema_updater.update_average(old_weight, up_weight)
+
+
+
+
+class Target_Net(nn.Module):
+    def __init__(self):
+        super(Online_Net, self).__init__()
+
+    def update_moving_average(self, ema_updater, online_net):
+        for current_params, ma_params in zip(online_net.parameters(), self.parameters()):
+            old_weight, up_weight = ma_params.data, current_params.data
+            ma_params.data = ema_updater.update_average(old_weight, up_weight)
 
 
 def set_requires_grad(model, val):
@@ -48,22 +65,13 @@ def get_target_net(online_net):
     target_net = copy.deepcopy(online_net)
     set_requires_grad(target_net, False)
     return target_net
-# class Target_Net(nn.Module):
-#     def __init__(self):
-#         super(Online_Net, self).__init__()
-#         self.model = torchvision.models.resnet18(pretrained=False)
-#         self.model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=3, bias=False)
-#         self.model.maxpool=nn.Identity()
-#     def forward(self, x):
-#         output = self.model(x)
-#         #size of the ouput is (batch_size,1000)
-#         return output
 
 
-def update_moving_average(ema_updater, ma_model, current_model):
-    for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-        old_weight, up_weight = ma_params.data, current_params.data
-        ma_params.data = ema_updater.update_average(old_weight, up_weight)
+
+# def update_moving_average(ema_updater, ma_model, current_model):
+#     for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+#         old_weight, up_weight = ma_params.data, current_params.data
+#         ma_params.data = ema_updater.update_average(old_weight, up_weight)
 
 
 
@@ -85,7 +93,7 @@ def MLP(projection_size, hidden_size):
     return nn.Sequential(
         nn.Linear(projection_size, hidden_size),
         nn.BatchNorm1d(hidden_size),
-        nn.ReLU(inplace=True),
+        nn.ReLU(),
         nn.Linear(hidden_size, projection_size),
     )
 
@@ -171,11 +179,14 @@ class cluster_loss(nn.Module):
 
         part_1 = -mat.diag().mean()/self.temperature
 
-        mat = torch.exp(mat/ self.temperature)
+        mat_0 = mat/self.temperature
 
-        mat = mat.fill_diagonal_(0)
+        mat_1 = torch.exp(mat_0).clone()
 
-        part_2 = torch.log(1+torch.relu(mat.sum(dim=1, keepdim=True))).mean()
+        mat_2 = mat_1.fill_diagonal_(0)
+
+
+        part_2 = torch.log(1+torch.relu(mat_2.sum(dim=1, keepdim=True))).mean()
 
         loss = part_1 + part_2
         
@@ -211,6 +222,8 @@ n_clusters = 10
 temperature = 0.5
 variance = 0.001
 lamda_PSL = 0.1
+epsilon = 1e-8
+
 
 #load the dataset
 datasets = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToTensor())
@@ -260,7 +273,7 @@ augmentation = Default_Augmentation(32).to(device)
 
 #randomly initialize the centroids
 centroids = torch.randn(n_clusters, 1000).to(device)
-
+#(torch.isnan(centroids).any())
 
 
 train_loss= []
@@ -272,7 +285,6 @@ for epoch in range(num_epochs):
 
     with torch.no_grad():
         target_net = get_target_net(online_net)
-        target_moving_average = update_moving_average(target_ema_updater, target_net, online_net)
 
 
 
@@ -283,24 +295,33 @@ for epoch in range(num_epochs):
 
 
             target_features_from_raw_input = target_net(images)
+            #(torch.isnan(target_features_from_raw_input).any())
             p_k_x_batch_size = get_p_k_x(target_features_from_raw_input, 10, centroids=centroids).to(device)
-
+            #(torch.isnan(p_k_x_batch_size).any())
 
             #update the centroids by mini_batch because of the error "cuda out of memory"
-            for i in range(n_clusters):
+            for k in range(n_clusters):
 
                 #p_k_x.shape = (N,num_clusters)
                 #get the points that belong to the i-th cluster
-                cluster_points = target_features_from_raw_input[p_k_x_batch_size[:, i] == 1]
+                cluster_points = target_features_from_raw_input[p_k_x_batch_size[:, k] == 1]
+
+                if(len(cluster_points)!=0):
                 #compute the mean of the points
-                centroids[i] = torch.mean(cluster_points, dim=0)
-            
+                    centroids[k] = torch.mean(cluster_points, dim=0)
+                #('%d:', i)
+                #(torch.isnan(centroids[i]).any())
+            #(torch.isnan(centroids).any())
 
             #get the augmented images
             images_one, images_two = augmentation(images)
+            # #(torch.isnan(images_one).any())
+            # #(torch.isnan(images_two).any())
             #get the online features
             online_features = online_net(images_one).to(device)
+            #(torch.isnan(online_features).any())
             target_features = target_net(images_two)
+            #(torch.isnan(target_features).any())
 
 
             #get the positive samples
@@ -308,28 +329,32 @@ for epoch in range(num_epochs):
 
             #get the positive features
             positive_features = positive_samples(online_features)
+            #(torch.isnan(positive_features).any())
 
             #compute the cluster centers for the online features
-            print(p_k_x_batch_size.T.is_cuda)
-            print(online_features.is_cuda)
+            # #(p_k_x_batch_size.T.is_cuda)
+            # #(online_features.is_cuda)
             centroids_online_features = torch.matmul(p_k_x_batch_size.T, online_features)
+            #(torch.isnan(centroids_online_features).any())
 
-            centroids_online_features = centroids_online_features / torch.norm(centroids_online_features, dim=1, keepdim=True)
 
+            centroids_online_features = centroids_online_features / (torch.norm(centroids_online_features, dim=1, keepdim=True)+epsilon)
+            #(torch.isnan(centroids_online_features).any())
             #the size of centroids_online_features is (n_clusters,1000)
 
 
             #compute the cluster centers for the target features
             centroids_target_features = torch.matmul(p_k_x_batch_size.T, target_features)
+            #(torch.isnan(centroids_target_features).any())
+            centroids_target_features = centroids_target_features / (torch.norm(centroids_target_features, dim=1, keepdim=True)+epsilon)
 
-            centroids_target_features = centroids_target_features / torch.norm(centroids_target_features, dim=1, keepdim=True)
-
+            #(torch.isnan(centroids_target_features).any())
             #the size of centroids_target_features is (n_clusters,1000)
 
 
             #get the predeicted features
             predicted_features = online_predictor(positive_features)
-
+            #(torch.isnan(predicted_features).any())
 
             optimizer_online.zero_grad()
             optimizer_predictor.zero_grad()
@@ -341,16 +366,16 @@ for epoch in range(num_epochs):
             loss_PSL = Cluster_Loss(centroids_online_features, centroids_target_features)
 
             loss = loss_PSA + lamda_PSL * loss_PSL
-            with torch.autograd.detect_anomaly():
-                loss.backward()
+           
+            loss.backward()
 
-            target_moving_average()
+            target_net.update_moving_average(target_ema_updater, online_net)
             optimizer_online.step()
             optimizer_predictor.step()
             train_loss.append(loss.item())
-            if i % 50 == 0:
+            if i % 50 ==0:
                 print('epoch:{}, iter:{}, loss:{}'.format(epoch, i, loss.item()))
-                  
+
 
 # plot_curve(train_loss, 'train_loss')
 # torch.save(online_net.state_dict(), 'online_net.pth')
